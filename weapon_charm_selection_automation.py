@@ -2,15 +2,14 @@
 """
 weapon_charm_selection_automation.py
 
-Single-hero weapon charm favoriter. Scans a narrow vertical strip at the star
-column and clicks any un-favorited (dark) star found. Presses the down arrow
-to advance the game's selection after each check.
+All-hero weapon charm favoriter. Navigates through every hero in the hero grid,
+opens each hero's Weapon Charms page, clicks un-favorited stars, then moves on.
 
 HOW TO USE:
-    1. Open a hero's Weapon Charms page.
-    2. Run this script — the countdown starts immediately.
-    3. Tab into Overwatch and position your cursor over the star column
-       (anywhere on the column, not necessarily on a star) before the countdown ends.
+    1. Open Overwatch to the hero selection grid (Weapon Charms cosmetics section).
+    2. Make sure your cursor is positioned on the star column (used to compute bbox).
+    3. Run this script — the countdown starts immediately.
+    4. Tab into Overwatch before the countdown ends.
 
 STOP: Press S or move the mouse to the top-left corner.
 
@@ -22,7 +21,10 @@ import sys
 import argparse
 import ctypes
 import time
+import json
+import os
 import numpy as np
+import cv2
 import pygetwindow as gw
 import mss
 
@@ -34,6 +36,10 @@ class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 VK_DOWN              = 0x28
+VK_LEFT              = 0x25
+VK_RIGHT             = 0x27
+VK_SPACE             = 0x20
+VK_ESCAPE            = 0x1B
 VK_S                 = 0x53
 VK_D                 = 0x44
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -53,62 +59,112 @@ def left_click():
     user32.mouse_event(MOUSEEVENTF_LEFTUP,   0, 0, 0, 0)
 
 def press_down():
-    user32.keybd_event(VK_DOWN, 0, 0,               0)
-    user32.keybd_event(VK_DOWN, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_DOWN,   0, 0,               0)
+    user32.keybd_event(VK_DOWN,   0, KEYEVENTF_KEYUP, 0)
 
-# ── Configuration ──────────────────────────────────────────────────────────────
+def press_left():
+    user32.keybd_event(VK_LEFT,   0, 0,               0)
+    user32.keybd_event(VK_LEFT,   0, KEYEVENTF_KEYUP, 0)
+
+def press_right():
+    user32.keybd_event(VK_RIGHT,  0, 0,               0)
+    user32.keybd_event(VK_RIGHT,  0, KEYEVENTF_KEYUP, 0)
+
+def press_space():
+    user32.keybd_event(VK_SPACE,  0, 0,               0)
+    user32.keybd_event(VK_SPACE,  0, KEYEVENTF_KEYUP, 0)
+
+def press_escape():
+    user32.keybd_event(VK_ESCAPE, 0, 0,               0)
+    user32.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0)
+
+# ── Configuration — charm selection ───────────────────────────────────────────
 
 KEY_PAUSE    = 0.075         # seconds after pressing down before scanning (lower once working)
-CLICK_PAUSE  = 0.075        # seconds after clicking
-COUNTDOWN    = 7           # seconds to tab into the game
+CLICK_PAUSE  = 0.075         # seconds after clicking a star
+COUNTDOWN    = 7             # seconds to tab into the game
 
-SCAN_HALF_W  = 40          # pixels left/right of cursor X to scan
-SCAN_HALF_H  = 20          # pixels above/below cursor Y to scan (just one row height)
+SCAN_HALF_W  = 40            # pixels left/right of cursor X to scan
+SCAN_HALF_H  = 20            # pixels above/below cursor Y to scan (just one row height)
 
 # Dark pixel thresholds — unselected stars are near-black.
 # Raise MAX_DARK if stars are missed; lower it if non-stars are clicked.
-MAX_DARK     = 80          # R, G, and B must all be below this to count as a dark star
+MAX_DARK     = 80            # R, G, and B must all be below this to count as a dark star
 
 # Orange pixel thresholds — selected stars are orange.
 # Tune if --click-selected misses or mis-clicks stars.
-ORANGE_MIN_R = 150         # R must be above this
-ORANGE_MIN_G = 80          # G must be above this
-ORANGE_MAX_B = 80          # B must be below this
+ORANGE_MIN_R = 150           # R must be above this
+ORANGE_MIN_G = 80            # G must be above this
+ORANGE_MAX_B = 80            # B must be below this
 
-# Pre-set cursor position (x, y) to snap to after the countdown.
+# Pre-set cursor position (x, y) to snap to at the start of each hero's charm page.
 # Set to None to use wherever the cursor already is.
-# Run once with START_POS = None and DEBUG = True to find the right position.
-START_POS    = (962, 1740)       # e.g. (1843, 612)
+# Run once with START_POS = None and --debug to find the right position.
+START_POS    = (962, 1740)
 
 # Flags — set via command line, not here:
 #   --debug           print scan results each iteration, save strip image, no clicking
 #   --click-all       click every row without checking star color
 #   --click-selected  click already-selected (orange) stars to deselect them
 
+# ── Configuration — hero grid navigation ──────────────────────────────────────
+
+# Number of heroes in each row. Add or remove entries for more/fewer rows.
+# Even rows (0, 2, …) are navigated left→right; odd rows (1, 3, …) right→left.
+HEROES_PER_ROW          = [30, 21]
+
+# Hero to start on. 0-indexed: row 0 is the top row, col 0 is the leftmost hero.
+START_ROW               = 0
+START_COL               = 0
+
+# How long to run charm selection on each hero before moving to the next.
+CHARM_SELECTION_SECONDS = 60
+
+HERO_NAV_PAUSE          = 0.15   # pause between hero-navigation key presses
+MENU_LOAD_PAUSE         = 1.5    # pause after opening hero popup / weapon charms page
+ESCAPE_PAUSE            = 0.5    # pause after each Escape press
+
+# Template image used to locate the Weapon Charms menu item after the popup opens.
+# Crop a tight screenshot of the Weapon Charms button and save it as this filename.
+WEAPON_CHARM_TEMPLATE   = "weapon_charms_template.png"
+MATCH_THRESHOLD         = 0.8    # 0–1 confidence; lower if it fails to find, raise if it false-matches
+
+PROGRESS_FILE           = "progress.json"
+
+# ── Progress persistence ───────────────────────────────────────────────────────
+
+def load_progress():
+    """Return (row, col) from the progress file, or None if it doesn't exist."""
+    if not os.path.exists(PROGRESS_FILE):
+        return None
+    with open(PROGRESS_FILE) as f:
+        data = json.load(f)
+    return data["row"], data["col"]
+
+def save_progress(row, col):
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump({"row": row, "col": col}, f)
+
+def reset_progress():
+    if os.path.exists(PROGRESS_FILE):
+        os.remove(PROGRESS_FILE)
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 _sct = mss.MSS()
 
 def find_dark_star(bbox):
-    """
-    Grab a strip of the screen and return the screen (x, y) of the first
-    dark (un-favorited) star pixel found, or None if none found.
-    """
+    """Return screen (x, y) of the first dark (un-favorited) star pixel, or None."""
     region = {"left": bbox[0], "top": bbox[1],
               "width": bbox[2] - bbox[0], "height": bbox[3] - bbox[1]}
-    raw = _sct.grab(region)
+    arr = np.array(_sct.grab(region))
     # mss returns BGRA — index 2=R, 1=G, 0=B
-    arr = np.array(raw)
-
     dark = (arr[:, :, 2] < MAX_DARK) & \
            (arr[:, :, 1] < MAX_DARK) & \
            (arr[:, :, 0] < MAX_DARK)
-
     ys, xs = np.where(dark)
     if len(ys) == 0:
         return None
-
-    # Return the topmost dark pixel translated back to screen coordinates.
     return bbox[0] + int(xs[0]), bbox[1] + int(ys[0])
 
 
@@ -126,63 +182,68 @@ def find_orange_star(bbox):
         return None
     return bbox[0] + int(xs[0]), bbox[1] + int(ys[0])
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="Weapon Charm Selection Automation")
-    parser.add_argument("--debug",          action="store_true", help="Print scan info and save strip image. Does not click.")
-    parser.add_argument("--click-all",      action="store_true", help="Click every row without checking star color.")
-    parser.add_argument("--click-selected", action="store_true", help="Click already-selected (orange) stars to deselect them.")
-    args = parser.parse_args()
-    debug          = args.debug
-    click_all      = args.click_all
-    click_selected = args.click_selected
+def find_on_screen(template_path):
+    """
+    Search the full screen for template_path using OpenCV template matching.
+    Returns the screen (x, y) center of the best match if confidence >= MATCH_THRESHOLD,
+    or None if not found.
+    """
+    template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+    if template is None:
+        print(f"  ERROR: template image not found: {template_path}")
+        return None
 
-    print("Weapon Charm Selection Automation")
-    print("==================================")
-    print()
-    print("Tab into the game and position your cursor over the star column.")
-    print(f"Starting in {COUNTDOWN} seconds ...")
-    for i in range(COUNTDOWN, 0, -1):
-        print(f"  {i}...")
-        time.sleep(1)
+    monitor = _sct.monitors[1]
+    raw = _sct.grab(monitor)
+    # mss returns BGRA; drop alpha to get BGR for OpenCV
+    screen = np.array(raw)[:, :, :3]
 
-    if START_POS is not None:
-        set_cursor_pos(*START_POS)
-        time.sleep(0.05)
+    result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
-    cx, cy = cursor_pos()
-    if debug:
-        print(f"Starting cursor position: ({cx}, {cy})  ← paste into START_POS to reuse")
-    bbox = (
-        max(0, cx - SCAN_HALF_W),
-        max(0, cy - SCAN_HALF_H),
-        cx + SCAN_HALF_W,
-        min(cy + SCAN_HALF_H, 2160),
-    )
-    print(f"Scanning strip: x={cx}±{SCAN_HALF_W}, y={cy}±{SCAN_HALF_H}")
+    if max_val < MATCH_THRESHOLD:
+        print(f"  WARNING: Weapon Charms button not found (confidence {max_val:.2f} < {MATCH_THRESHOLD})")
+        return None
 
-    wins = gw.getWindowsWithTitle("Overwatch")
-    if not wins:
-        sys.exit("ERROR: Overwatch window not found.")
-    wins[0].activate()
-    time.sleep(0.3)
+    th, tw = template.shape[:2]
+    cx = max_loc[0] + tw // 2
+    cy = max_loc[1] + th // 2
+    return cx, cy
 
+
+def build_hero_list():
+    """Return (row, col) tuples in snake-pattern navigation order."""
+    heroes = []
+    for row_idx, count in enumerate(HEROES_PER_ROW):
+        if row_idx % 2 == 0:
+            heroes.extend((row_idx, col) for col in range(count))
+        else:
+            heroes.extend((row_idx, col) for col in range(count - 1, -1, -1))
+    return heroes
+
+
+def run_charm_selection(bbox, duration_seconds, click_all, click_selected, debug, label=""):
+    """
+    Run charm selection for up to duration_seconds seconds.
+    Returns (total_clicked, stopped_by_user).
+    """
+    end_time = time.time() + duration_seconds
     total = 0
     first_iter = True
 
-    while True:
-        # S key or top-left corner = stop
+    while time.time() < end_time:
+        remaining = max(0, int(end_time - time.time()))
+        print(f"\r{label}  {remaining} seconds...", end="", flush=True)
         if user32.GetAsyncKeyState(VK_S) & 0x8000:
-            break
+            return total, True
 
-        # D key = reset cursor to starting position
         if user32.GetAsyncKeyState(VK_D) & 0x8000 and START_POS is not None:
             set_cursor_pos(*START_POS)
             time.sleep(0.05)
         x, y = cursor_pos()
         if x < 5 and y < 5:
-            break
+            return total, True
 
         if debug and first_iter:
             region = {"left": bbox[0], "top": bbox[1],
@@ -196,7 +257,7 @@ def main():
             left_click()
             total += 1
         elif debug:
-            dark_pos  = find_dark_star(bbox)
+            dark_pos   = find_dark_star(bbox)
             orange_pos = find_orange_star(bbox)
             print(f"  unselected: {dark_pos}  selected: {orange_pos}")
         elif click_selected:
@@ -217,7 +278,129 @@ def main():
         press_down()
         time.sleep(KEY_PAUSE)
 
-    print(f"Done. Favorited {total} charm(s).")
+    return total, False
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="All-Hero Weapon Charm Selection Automation")
+    parser.add_argument("--debug",          action="store_true", help="Print scan info and save strip image. Does not click.")
+    parser.add_argument("--click-all",      action="store_true", help="Click every row without checking star color.")
+    parser.add_argument("--click-selected", action="store_true", help="Click already-selected (orange) stars to deselect them.")
+    parser.add_argument("--row",            type=int, default=None, help="Override starting row (0-indexed).")
+    parser.add_argument("--col",            type=int, default=None, help="Override starting column (0-indexed).")
+    args = parser.parse_args()
+    debug          = args.debug
+    click_all      = args.click_all
+    click_selected = args.click_selected
+
+    # Resolve starting hero: CLI args > saved progress > config defaults
+    saved_progress = load_progress()
+    if args.row is not None and args.col is not None:
+        resume_row, resume_col = args.row - 1, args.col - 1
+    elif saved_progress is not None:
+        resume_row, resume_col = saved_progress
+    else:
+        resume_row, resume_col = START_ROW, START_COL
+
+    heroes = build_hero_list()
+    try:
+        start_idx = heroes.index((resume_row, resume_col))
+    except ValueError:
+        sys.exit(f"ERROR: (row={resume_row + 1}, col={resume_col + 1}) not found in hero grid.")
+    total_heroes = len(heroes)
+
+    print("All-Hero Weapon Charm Selection Automation")
+    print("==========================================")
+    print()
+    print(f"Tab into Overwatch, then select a Weapon Charm from the menu.")
+    print(f"Starting at row: {resume_row + 1}, col: {resume_col + 1}")
+    print(f"Starting in {COUNTDOWN} seconds ...")
+    for i in range(COUNTDOWN, 0, -1):
+        print(f"  {i}...")
+        time.sleep(1)
+
+    if START_POS is not None:
+        set_cursor_pos(*START_POS)
+        time.sleep(0.05)
+
+    cx, cy = cursor_pos()
+    if debug:
+        print(f"Starting cursor position: ({cx}, {cy})  ← paste into START_POS to reuse")
+    bbox = (
+        max(0, cx - SCAN_HALF_W),
+        max(0, cy - SCAN_HALF_H),
+        cx + SCAN_HALF_W,
+        min(cy + SCAN_HALF_H, 2160),
+    )
+
+
+    wins = gw.getWindowsWithTitle("Overwatch")
+    if not wins:
+        sys.exit("ERROR: Overwatch window not found.")
+    wins[0].activate()
+    time.sleep(0.3)
+
+
+    grand_total  = 0
+
+    for i in range(start_idx, len(heroes)):
+        curr_row, curr_col = heroes[i]
+        label = f"Hero {i + 1}/{total_heroes}  (row={curr_row + 1}, col={curr_col + 1})"
+        save_progress(curr_row, curr_col)
+
+        # On a fresh start the first hero is already on the weapon charms page — skip navigation.
+        # On resume, or for any hero after the first, navigate into the weapon charms page.
+        if i != start_idx:
+            press_space()
+            time.sleep(MENU_LOAD_PAUSE)
+            charm_pos = find_on_screen(WEAPON_CHARM_TEMPLATE)
+            if charm_pos is None:
+                print("  Skipping hero — could not locate Weapon Charms button.")
+                press_escape()
+                time.sleep(ESCAPE_PAUSE)
+                continue
+            set_cursor_pos(*charm_pos)
+            left_click()
+            time.sleep(MENU_LOAD_PAUSE)
+
+        # Snap cursor to star column
+        if START_POS is not None:
+            set_cursor_pos(*START_POS)
+            time.sleep(0.05)
+
+        # Run charm selection for this hero
+        total, stopped = run_charm_selection(bbox, CHARM_SELECTION_SECONDS,
+                                             click_all, click_selected, debug, label)
+        grand_total += total
+        print(f"\r{label}  done. ({total} charm(s) favorited)")
+
+        if stopped:
+            print("Stopped by user.")
+            sys.exit(0)
+
+        # Return to hero grid
+        press_escape()
+        time.sleep(ESCAPE_PAUSE)
+        press_escape()
+        time.sleep(ESCAPE_PAUSE)
+
+        # Navigate to next hero
+        if i + 1 < len(heroes):
+            next_row, _ = heroes[i + 1]
+            if next_row == curr_row:
+                # Same row — advance one hero in the current direction
+                if curr_row % 2 == 0:
+                    press_right()
+                else:
+                    press_left()
+            else:
+                # End of row — move down to the next row
+                press_down()
+            time.sleep(ESCAPE_PAUSE)
+
+    reset_progress()
+    print(f"\nAll done. {grand_total} total charm(s) favorited.")
 
 
 if __name__ == "__main__":
