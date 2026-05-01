@@ -11,18 +11,37 @@ HOW TO USE:
     3. Run this script — the countdown starts immediately.
     4. Tab into Overwatch before the countdown ends.
 
+USAGE:
+    python weapon_charm_selection_automation.py [row] [col] [--debug] [--click-all] [--click-selected]
+
+    row, col   Optional 1-indexed starting position. Overrides saved progress.
+               Example: python weapon_charm_selection_automation.py 1 2
+
 STOP: Press S or move the mouse to the top-left corner.
 
+EMAIL NOTIFICATIONS:
+    The script sends an email to moseleywalton@gmail.com when it finishes or when
+    the Weapon Charms button fails to appear MAX_CONSECUTIVE_FAILURES times in a row
+    (default 3), which indicates a disconnect or other unrecoverable error.
+
+    Set these environment variables to enable email (one-time setup):
+        setx OW_SMTP_USER "youraddress@gmail.com"
+        setx OW_SMTP_PASS "your_gmail_app_password"
+
+    Generate an App Password at: myaccount.google.com/apppasswords
+
 REQUIREMENTS:
-    pip install pygetwindow mss numpy
+    pip install pygetwindow mss numpy opencv-python
 """
 
 import sys
 import argparse
 import ctypes
+import smtplib
 import time
 import json
 import os
+from email.mime.text import MIMEText
 import numpy as np
 import cv2
 import pygetwindow as gw
@@ -131,6 +150,17 @@ MATCH_THRESHOLD         = 0.8    # 0–1 confidence; lower if it fails to find, 
 
 PROGRESS_FILE           = "progress.json"
 
+# ── Configuration — email notifications ───────────────────────────────────────
+
+RECIPIENT_EMAIL       = "moseleywalton@gmail.com"
+# Set OW_SMTP_USER (sender Gmail) and OW_SMTP_PASS (Gmail App Password) as env vars.
+SMTP_USER             = os.environ.get("OW_SMTP_USER", "")
+SMTP_PASS             = os.environ.get("OW_SMTP_PASS", "")
+
+# How many consecutive "Weapon Charms button not found" failures before treating it as a
+# disconnect / unrecoverable error, sending an email, and exiting.
+MAX_CONSECUTIVE_FAILURES = 3
+
 # ── Progress persistence ───────────────────────────────────────────────────────
 
 def load_progress():
@@ -148,6 +178,26 @@ def save_progress(row, col):
 def reset_progress():
     if os.path.exists(PROGRESS_FILE):
         os.remove(PROGRESS_FILE)
+
+# ── Email ──────────────────────────────────────────────────────────────────────
+
+def send_email(subject, body):
+    """Send a notification email. Skips silently if credentials are not configured."""
+    if not SMTP_USER or not SMTP_PASS:
+        print(f"  (Email skipped — set OW_SMTP_USER and OW_SMTP_PASS env vars to enable)")
+        return
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"]    = SMTP_USER
+    msg["To"]      = RECIPIENT_EMAIL
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, RECIPIENT_EMAIL, msg.as_string())
+        print(f"  Email sent to {RECIPIENT_EMAIL}: {subject}")
+    except Exception as e:
+        print(f"  WARNING: Failed to send email: {e}")
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -287,8 +337,8 @@ def main():
     parser.add_argument("--debug",          action="store_true", help="Print scan info and save strip image. Does not click.")
     parser.add_argument("--click-all",      action="store_true", help="Click every row without checking star color.")
     parser.add_argument("--click-selected", action="store_true", help="Click already-selected (orange) stars to deselect them.")
-    parser.add_argument("--row",            type=int, default=None, help="Override starting row (0-indexed).")
-    parser.add_argument("--col",            type=int, default=None, help="Override starting column (0-indexed).")
+    parser.add_argument("row",              type=int, nargs="?",    default=None, help="Starting row (1-indexed).")
+    parser.add_argument("col",              type=int, nargs="?",    default=None, help="Starting column (1-indexed).")
     args = parser.parse_args()
     debug          = args.debug
     click_all      = args.click_all
@@ -342,7 +392,8 @@ def main():
     time.sleep(0.3)
 
 
-    grand_total  = 0
+    grand_total          = 0
+    consecutive_failures = 0
 
     for i in range(start_idx, len(heroes)):
         curr_row, curr_col = heroes[i]
@@ -356,10 +407,21 @@ def main():
             time.sleep(MENU_LOAD_PAUSE)
             charm_pos = find_on_screen(WEAPON_CHARM_TEMPLATE)
             if charm_pos is None:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    send_email(
+                        "Overwatch Charm Automation — Stopped (repeated failures)",
+                        f"The Weapon Charms button could not be found {consecutive_failures} times in a row.\n\n"
+                        f"Last hero: {i + 1}/{total_heroes} (row={curr_row + 1}, col={curr_col + 1}).\n"
+                        f"Progress saved. Run the script again to resume."
+                    )
+                    print(f"  Weapon Charms button not found {consecutive_failures} times in a row. Exiting.")
+                    sys.exit(1)
                 print("  Skipping hero — could not locate Weapon Charms button.")
                 press_escape()
                 time.sleep(ESCAPE_PAUSE)
                 continue
+            consecutive_failures = 0
             set_cursor_pos(*charm_pos)
             left_click()
             time.sleep(MENU_LOAD_PAUSE)
@@ -401,6 +463,10 @@ def main():
 
     reset_progress()
     print(f"\nAll done. {grand_total} total charm(s) favorited.")
+    send_email(
+        "Overwatch Charm Automation — Complete",
+        f"All {total_heroes} heroes processed! {grand_total} total charm(s) favorited."
+    )
 
 
 if __name__ == "__main__":
