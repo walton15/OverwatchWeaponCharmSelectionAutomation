@@ -99,16 +99,26 @@ def press_escape():
 
 # ── Configuration — charm selection ───────────────────────────────────────────
 
-KEY_PAUSE    = 0.075         # seconds after pressing down before scanning (lower once working)
+KEY_PAUSE    = 0.18          # seconds after pressing down before scanning — must exceed
+                             # the menu scroll animation, or the scan catches the star
+                             # mid-glide and clicks the gap. 0.075 was too fast; 0.30 was
+                             # reliable. Raise toward 0.30 if it starts missing rows.
 CLICK_PAUSE  = 0.075         # seconds after clicking a star
 COUNTDOWN    = 7             # seconds to tab into the game
 
-SCAN_HALF_W  = 40            # pixels left/right of cursor X to scan
-SCAN_HALF_H  = 20            # pixels above/below cursor Y to scan (just one row height)
+SCAN_HALF_W  = 20            # pixels left/right of cursor X to scan (tight on the star)
+SCAN_HALF_H  = 12            # pixels above/below cursor Y to scan (just the star glyph)
 
 # Dark pixel thresholds — unselected stars are near-black.
 # Raise MAX_DARK if stars are missed; lower it if non-stars are clicked.
 MAX_DARK     = 80            # R, G, and B must all be below this to count as a dark star
+
+# Minimum number of matching pixels required to count as a real star (not stray
+# background). A star glyph fills many pixels; dark gaps between stars or dark
+# edges near a selected star are only a handful. Run --debug to see live counts
+# and set these between the "star present" count and the "no star" count.
+MIN_DARK_PIXELS   = 15       # dark pixels needed to click an un-favorited star
+MIN_ORANGE_PIXELS = 15       # orange pixels needed to click a selected star
 
 # Orange pixel thresholds — selected stars are orange.
 # Tune if --click-selected misses or mis-clicks stars.
@@ -130,7 +140,7 @@ START_POS    = (962, 1740)
 
 # Number of heroes in each row. Add or remove entries for more/fewer rows.
 # Even rows (0, 2, …) are navigated left→right; odd rows (1, 3, …) right→left.
-HEROES_PER_ROW          = [30, 21]
+HEROES_PER_ROW          = [26, 26]
 
 # Hero to start on. 0-indexed: row 0 is the top row, col 0 is the leftmost hero.
 START_ROW               = 0
@@ -203,8 +213,24 @@ def send_email(subject, body):
 
 _sct = mss.MSS()
 
+def _scan(bbox, mask):
+    """Given a boolean pixel mask, return (count, centroid) in screen coords.
+
+    centroid is the (x, y) center of mass of the matching pixels — i.e. the
+    middle of the star — so clicks land on the star itself rather than at a
+    fixed point that may sit in the gap beside it. Returns (0, None) if empty.
+    """
+    ys, xs = np.where(mask)
+    count = len(xs)
+    if count == 0:
+        return 0, None
+    cx = bbox[0] + int(round(xs.mean()))
+    cy = bbox[1] + int(round(ys.mean()))
+    return count, (cx, cy)
+
+
 def find_dark_star(bbox):
-    """Return screen (x, y) of the first dark (un-favorited) star pixel, or None."""
+    """Return (count, centroid) of dark (un-favorited) star pixels in the region."""
     region = {"left": bbox[0], "top": bbox[1],
               "width": bbox[2] - bbox[0], "height": bbox[3] - bbox[1]}
     arr = np.array(_sct.grab(region))
@@ -212,14 +238,11 @@ def find_dark_star(bbox):
     dark = (arr[:, :, 2] < MAX_DARK) & \
            (arr[:, :, 1] < MAX_DARK) & \
            (arr[:, :, 0] < MAX_DARK)
-    ys, xs = np.where(dark)
-    if len(ys) == 0:
-        return None
-    return bbox[0] + int(xs[0]), bbox[1] + int(ys[0])
+    return _scan(bbox, dark)
 
 
 def find_orange_star(bbox):
-    """Return screen (x, y) of the first orange (selected) star pixel, or None."""
+    """Return (count, centroid) of orange (selected) star pixels in the region."""
     region = {"left": bbox[0], "top": bbox[1],
               "width": bbox[2] - bbox[0], "height": bbox[3] - bbox[1]}
     arr = np.array(_sct.grab(region))
@@ -227,10 +250,7 @@ def find_orange_star(bbox):
     orange = (arr[:, :, 2] > ORANGE_MIN_R) & \
              (arr[:, :, 1] > ORANGE_MIN_G) & \
              (arr[:, :, 0] < ORANGE_MAX_B)
-    ys, xs = np.where(orange)
-    if len(ys) == 0:
-        return None
-    return bbox[0] + int(xs[0]), bbox[1] + int(ys[0])
+    return _scan(bbox, orange)
 
 
 def find_on_screen(template_path):
@@ -307,26 +327,30 @@ def run_charm_selection(bbox, duration_seconds, click_all, click_selected, debug
             left_click()
             total += 1
         elif debug:
-            dark_pos   = find_dark_star(bbox)
-            orange_pos = find_orange_star(bbox)
-            print(f"  unselected: {dark_pos}  selected: {orange_pos}")
+            dark_count, dark_pos     = find_dark_star(bbox)
+            orange_count, orange_pos = find_orange_star(bbox)
+            print(f"  dark px: {dark_count} @ {dark_pos} (>= {MIN_DARK_PIXELS} clicks)  "
+                  f"orange px: {orange_count} @ {orange_pos} (>= {MIN_ORANGE_PIXELS} clicks)")
         elif click_selected:
-            star_pos = find_orange_star(bbox)
-            if star_pos:
-                set_cursor_pos(*star_pos)
+            # Click the center of the detected star. Its screen position is stable
+            # (the list scrolls under a fixed reticle), so aiming at the centroid
+            # lands on the star without drifting.
+            count, pos = find_orange_star(bbox)
+            if count >= MIN_ORANGE_PIXELS and pos:
+                set_cursor_pos(*pos)
                 left_click()
                 total += 1
                 time.sleep(CLICK_PAUSE)
         else:
-            star_pos = find_dark_star(bbox)
-            if star_pos:
-                set_cursor_pos(*star_pos)
+            count, pos = find_dark_star(bbox)
+            if count >= MIN_DARK_PIXELS and pos:
+                set_cursor_pos(*pos)
                 left_click()
                 total += 1
                 time.sleep(CLICK_PAUSE)
 
         press_down()
-        time.sleep(KEY_PAUSE)
+        time.sleep(KEY_PAUSE)  # let the scroll animation settle before the next scan
 
     return total, False
 
@@ -423,6 +447,7 @@ def main():
                 continue
             consecutive_failures = 0
             set_cursor_pos(*charm_pos)
+            time.sleep(0.05)
             left_click()
             time.sleep(MENU_LOAD_PAUSE)
 
